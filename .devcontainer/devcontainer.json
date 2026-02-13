@@ -1,0 +1,65 @@
+{
+  "name": "index-watch-devcontainer",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "containerEnv": {
+    "UV_LINK_MODE": "copy"
+  },
+  "postCreateCommand": "make setup",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.13",
+      "installTools": true,
+      "toolsToInstall": "uv"
+    },
+    "ghcr.io/devcontainers-extra/features/zsh-plugins:0": {
+      "plugins": "npm git zsh-autosuggestions zsh-syntax-highlighting sudo",
+      "omzPlugins": "https://github.com/zsh-users/zsh-autosuggestions https://github.com/zsh-users/zsh-syntax-highlighting.git",
+      "username": "vscode"
+    },
+    "ghcr.io/stuartleeks/dev-container-features/shell-history:0": {},
+    "ghcr.io/stu-bell/devcontainer-features/claude-code:0": {},
+    "ghcr.io/devcontainers-extra/features/pre-commit:2": {
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "installDockerBuildx": true,
+      "installDockerComposeSwitch": true,
+      "version": "latest",
+      "dockerDashComposeVersion": "latest"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "charliermarsh.ruff",
+        "nsarrazin.pep723-uv-interpreter",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "[json]": {
+          "editor.defaultFormatter": "vscode.json-language-features",
+          "files.insertFinalNewline": true
+        },
+        "[jsonc]": {
+          "editor.defaultFormatter": "vscode.json-language-features",
+          "files.insertFinalNewline": true
+        },
+        "[python]": {
+          "editor.rulers": [
+            88
+          ],
+          "editor.formatOnSave": true,
+          "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+          },
+          "editor.defaultFormatter": "charliermarsh.ruff",
+          "editor.formatOnType": true
+        },
+        "[toml]": {
+          "editor.defaultFormatter": "tamasfe.even-better-toml"
+        },
+        "ruff.fixAll": true
+      }
+    }
+  }
+}

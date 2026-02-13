@@ -1,0 +1,30 @@
+# Env and secrets
+.env
+.env.local
+*.pem
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# IDE and OS
+.idea/
+.vscode/
+.cursor/
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/settings.local.json
+
+# Optional: uncomment if you don’t want to commit the lock file
+# uv.lock
