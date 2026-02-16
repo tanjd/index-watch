@@ -33,7 +33,8 @@
       "extensions": [
         "charliermarsh.ruff",
         "nsarrazin.pep723-uv-interpreter",
-        "tamasfe.even-better-toml"
+        "tamasfe.even-better-toml",
+        "detachhead.basedpyright"
       ],
       "settings": {
         "[json]": {
@@ -58,7 +59,9 @@
         "[toml]": {
           "editor.defaultFormatter": "tamasfe.even-better-toml"
         },
-        "ruff.fixAll": true
+        "ruff.fixAll": true,
+        "python.analysis.typeCheckingMode": "off",
+        "basedpyright.analysis.useLibraryCodeForTypes": true
       }
     }
   }
