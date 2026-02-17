@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-02-17)
+
+### Features
+
+- Add database-backed subscriber management
+  ([`7af564f`](https://github.com/tanjd/index-watch/commit/7af564f9ef22e8a6871762e423b5eed7fcfb1031))
+
+
 ## v1.0.1 (2026-02-16)
 
 ### Bug Fixes

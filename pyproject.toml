@@ -11,7 +11,7 @@ include = ["index_watch*"]
 
 [project]
 name = "index-watch"
-version = "1.0.1"
+version = "1.1.0"
 description = "Telegram bot for index-watch"
 readme = "README.md"
 requires-python = ">=3.10"
