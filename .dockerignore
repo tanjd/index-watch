@@ -4,6 +4,9 @@
 !.env.example
 *.pem
 
+# Database (should be volume-mounted, not in image)
+data/
+
 # Virtual env and caches
 .venv
 __pycache__

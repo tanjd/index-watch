@@ -2,12 +2,15 @@
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from index_watch import database
 from index_watch.alerts import AlertState
 from index_watch.config import Config
 from index_watch.fear_greed import fetch_fear_greed
@@ -28,17 +31,24 @@ logger = logging.getLogger(__name__)
 
 alert_state = AlertState()
 
+# Rate limiting: per-user cooldown for /daily command (5 minutes)
+_rate_limit_daily: dict[str, datetime] = {}
+RATE_LIMIT_COOLDOWN_SECONDS = 5 * 60  # 5 minutes
+
 
 def _build_daily_report(config: Config) -> str:
     """Build the full daily report text (sync, for use from async)."""
     index_blocks: list[tuple[str, str]] = []
     history_blocks: list[str] = []
+    data_timestamps: list[datetime] = []
 
     for symbol, name in config.index_symbols.items():
-        metrics = get_index_metrics(symbol, name, years=config.history_years)
-        if metrics:
+        result = get_index_metrics(symbol, name, years=config.history_years)
+        if result:
+            metrics, fetched_at = result
+            data_timestamps.append(fetched_at)
             index_blocks.append((name, format_drawdown_block(name, metrics)))
-            closes = fetch_index_history(symbol, years=config.history_years)
+            closes, _ = fetch_index_history(symbol, years=config.history_years)
             if closes:
                 freq = historical_drawdown_frequency(closes, config.drawdown_thresholds_pct)
                 history_blocks.append(
@@ -49,30 +59,51 @@ def _build_daily_report(config: Config) -> str:
 
     fear_greed = fetch_fear_greed()
     fear_greed_line = format_fear_greed(fear_greed)
-    return format_daily_report(index_blocks, fear_greed_line, history_blocks)
+
+    # Use earliest data timestamp for "Updated:" display
+    data_timestamp = min(data_timestamps) if data_timestamps else datetime.now(timezone.utc)
+
+    return format_daily_report(index_blocks, fear_greed_line, history_blocks, data_timestamp)
 
 
 async def send_daily_report(app: Application[Any, Any, Any, Any, Any, Any], config: Config) -> None:
-    """Scheduled job: send daily report to all chat_ids."""
-    if not config.chat_ids:
-        logger.warning("No TELEGRAM_CHAT_IDS configured; skipping daily report")
+    """Scheduled job: send daily report to all active subscribers."""
+    # Get subscribers from database (falls back to .env for backward compatibility)
+    subscribers = database.get_active_subscribers()
+    if not subscribers and config.chat_ids:
+        logger.info("No active subscribers in DB, using .env chat_ids")
+        subscribers = config.chat_ids
+
+    if not subscribers:
+        logger.warning("No subscribers configured; skipping daily report")
         return
+
+    logger.info("Generating daily report...")
     report = await asyncio.to_thread(_build_daily_report, config)
-    for chat_id in config.chat_ids:
+    logger.info("Daily report generated successfully")
+
+    sent_count = 0
+    for chat_id in subscribers:
         try:
             await app.bot.send_message(chat_id=chat_id, text=report, parse_mode="HTML")
+            database.update_last_daily_sent(chat_id)
+            logger.info("Daily report sent to chat_id=%s", chat_id)
+            sent_count += 1
         except Exception as e:
             logger.exception("Failed to send daily report to %s: %s", chat_id, e)
 
+    logger.info("Daily report sent to %d/%d subscribers", sent_count, len(subscribers))
 
-def _check_drawdown_alerts(config: Config) -> list[tuple[str, str]]:
+
+def _check_drawdown_alerts(config: Config, subscribers: list[str]) -> list[tuple[str, str]]:
     """Check all indices for threshold breaches; return list of (chat_id, message) to send."""
     results: list[tuple[str, str]] = []
     for symbol, name in config.index_symbols.items():
-        metrics = get_index_metrics(symbol, name, years=config.history_years)
-        if not metrics:
+        result = get_index_metrics(symbol, name, years=config.history_years)
+        if not result:
             continue
-        closes = fetch_index_history(symbol, years=config.history_years)
+        metrics, _ = result
+        closes, _ = fetch_index_history(symbol, years=config.history_years)
         total_days = len(closes)
         alert_state.on_drawdown_improved(
             symbol, metrics.current_drawdown_pct, config.drawdown_thresholds_pct
@@ -85,7 +116,7 @@ def _check_drawdown_alerts(config: Config) -> list[tuple[str, str]]:
             msg = format_drawdown_alert(
                 name, metrics.current_drawdown_pct, threshold, day_count, total_days
             )
-            for chat_id in config.chat_ids:
+            for chat_id in subscribers:
                 results.append((chat_id, msg))
             alert_state.mark_sent(symbol, threshold)
     return results
@@ -95,14 +126,44 @@ async def check_and_send_alerts(
     app: Application[Any, Any, Any, Any, Any, Any], config: Config
 ) -> None:
     """Scheduled job: check drawdown thresholds and send alerts."""
-    if not config.chat_ids:
+    # Get subscribers from database (falls back to .env for backward compatibility)
+    subscribers = database.get_active_subscribers()
+    if not subscribers and config.chat_ids:
+        subscribers = config.chat_ids
+
+    if not subscribers:
         return
-    to_send = await asyncio.to_thread(_check_drawdown_alerts, config)
+
+    logger.info("Checking drawdown alerts...")
+    to_send = await asyncio.to_thread(_check_drawdown_alerts, config, subscribers)
+
+    if not to_send:
+        logger.info("No alerts to send")
+        # Save alert state even if no alerts
+        try:
+            database.save_alert_state(alert_state.sent)
+        except Exception as e:
+            logger.warning("Failed to save alert state: %s", e)
+        return
+
+    logger.info("Sending %d alert(s)...", len(to_send))
+    sent_count = 0
     for chat_id, text in to_send:
         try:
             await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            database.update_last_alert_sent(chat_id)
+            logger.info("Alert sent to chat_id=%s", chat_id)
+            sent_count += 1
         except Exception as e:
             logger.exception("Failed to send alert to %s: %s", chat_id, e)
+
+    logger.info("Sent %d/%d alerts successfully", sent_count, len(to_send))
+
+    # Save alert state to database
+    try:
+        database.save_alert_state(alert_state.sent)
+    except Exception as e:
+        logger.warning("Failed to save alert state: %s", e)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -110,24 +171,57 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     await update.message.reply_text(
-        "Index Watch — crash-buy helper.\n\n"
-        "Commands:\n"
-        "• /daily — get today's drawdown report\n"
-        "• /alerts — show configured drawdown thresholds\n"
-        "Set TELEGRAM_CHAT_IDS to receive daily reports and drawdown alerts."
+        "📈 <b>Index Watch</b> — crash-buy helper\n\n"
+        "<b>Commands:</b>\n"
+        "• /subscribe — Get daily reports and drawdown alerts\n"
+        "• /unsubscribe — Stop receiving notifications\n"
+        "• /status — Check your subscription status\n"
+        "• /daily — Get today's drawdown report\n"
+        "• /alerts — Show configured thresholds\n"
+        "• /debug — Show scheduler status\n\n"
+        "<i>Use /subscribe to start receiving notifications!</i>",
+        parse_mode="HTML",
     )
 
 
 async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /daily — manual daily report."""
+    """Handle /daily — manual daily report with rate limiting."""
     if not update.message:
         return
+
+    chat_id = str(update.message.chat_id)
     config = context.bot_data.get("config")
+
     if not config:
-        await update.message.reply_text("Config not loaded.")
+        await update.message.reply_text("⚠️ Bot is starting up, please try again in a moment.")
         return
-    report = await asyncio.to_thread(_build_daily_report, config)
-    await update.message.reply_text(report, parse_mode="HTML")
+
+    # Rate limiting: 1 request per 5 minutes per user
+    now = datetime.now(timezone.utc)
+    if chat_id in _rate_limit_daily:
+        elapsed = (now - _rate_limit_daily[chat_id]).total_seconds()
+        if elapsed < RATE_LIMIT_COOLDOWN_SECONDS:
+            remaining = int(RATE_LIMIT_COOLDOWN_SECONDS - elapsed)
+            minutes = remaining // 60
+            seconds = remaining % 60
+            await update.message.reply_text(
+                f"⏱ Please wait {minutes}m {seconds}s before requesting another report.\n\n"
+                "This helps protect our API quota. Use /status to see scheduled report times.",
+                parse_mode="HTML",
+            )
+            return
+
+    _rate_limit_daily[chat_id] = now
+
+    try:
+        report = await asyncio.to_thread(_build_daily_report, config)
+        await update.message.reply_text(report, parse_mode="HTML")
+    except Exception:
+        logger.exception("Failed to generate daily report for %s", chat_id)
+        await update.message.reply_text(
+            "❌ Failed to fetch market data. This usually means Yahoo Finance is "
+            "temporarily unavailable. Please try again in a few minutes."
+        )
 
 
 async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -145,26 +239,221 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(parts))
 
 
+async def cmd_subscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /subscribe — subscribe to daily reports and alerts."""
+    if not update.message:
+        return
+
+    chat_id = str(update.message.chat_id)
+    username = update.message.from_user.username if update.message.from_user else None
+
+    try:
+        is_new = database.add_subscriber(chat_id, username)
+        if is_new:
+            await update.message.reply_text(
+                "✅ <b>You're subscribed!</b>\n\n"
+                "You'll receive:\n"
+                "• Daily reports at 22:00 UTC (Mon-Fri)\n"
+                "• Real-time drawdown alerts (5%, 10%, 15%, 20%)\n\n"
+                "Use /unsubscribe to stop notifications anytime.\n"
+                "Use /status to check your subscription.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ You're already subscribed!\n\nUse /status to check your subscription details.",
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        logger.exception("Failed to subscribe user %s: %s", chat_id, e)
+        await update.message.reply_text(
+            "❌ Failed to subscribe. Please try again later or contact support."
+        )
+
+
+async def cmd_unsubscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /unsubscribe — unsubscribe from notifications."""
+    if not update.message:
+        return
+
+    chat_id = str(update.message.chat_id)
+
+    try:
+        success = database.remove_subscriber(chat_id)
+        if success:
+            await update.message.reply_text(
+                "👋 <b>You've been unsubscribed.</b>\n\n"
+                "You'll no longer receive daily reports or alerts.\n\n"
+                "Use /subscribe to re-enable notifications anytime.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ You're not currently subscribed.\n\n"
+                "Use /subscribe to start receiving notifications.",
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        logger.exception("Failed to unsubscribe user %s: %s", chat_id, e)
+        await update.message.reply_text("❌ Failed to unsubscribe. Please try again later.")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /status — show subscription status."""
+    if not update.message:
+        return
+
+    chat_id = str(update.message.chat_id)
+    config = context.bot_data.get("config")
+    scheduler = context.bot_data.get("scheduler")
+
+    try:
+        is_subscribed = database.is_subscribed(chat_id)
+
+        lines = ["<b>📊 Your Subscription Status</b>\n"]
+
+        if is_subscribed:
+            lines.append("✅ <b>Status:</b> Subscribed")
+
+            # Get next report time
+            if scheduler:
+                daily_job = scheduler.get_job("daily_report")
+                if daily_job and daily_job.next_run_time:
+                    lines.append(f"📅 <b>Next daily report:</b> {daily_job.next_run_time}")
+
+            # Alert info
+            if config:
+                thresholds = ", ".join(f"{t}%" for t in config.drawdown_thresholds_pct)
+                lines.append(f"🔔 <b>Alert thresholds:</b> {thresholds}")
+                lines.append(f"⏱ <b>Check interval:</b> Every {config.alert_check_minutes} min")
+
+            lines.append("\nUse /unsubscribe to stop notifications")
+        else:
+            lines.append("❌ <b>Status:</b> Not subscribed")
+            lines.append("\nUse /subscribe to start receiving notifications")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.exception("Failed to get status for user %s: %s", chat_id, e)
+        await update.message.reply_text("❌ Failed to retrieve status. Please try again later.")
+
+
+async def cmd_mystats(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /mystats — show personal notification history."""
+    if not update.message:
+        return
+
+    chat_id = str(update.message.chat_id)
+
+    try:
+        stats = database.get_subscriber_stats(chat_id)
+
+        if not stats:
+            await update.message.reply_text(
+                "ℹ️ You're not subscribed.\n\nUse /subscribe to start receiving notifications.",
+                parse_mode="HTML",
+            )
+            return
+
+        lines = ["<b>📈 Your Subscription Stats</b>\n"]
+
+        if stats["subscribed_at"]:
+            lines.append(f"📅 <b>Subscribed since:</b> {stats['subscribed_at']}")
+
+        if stats["last_daily_sent"]:
+            lines.append(f"📊 <b>Last daily report:</b> {stats['last_daily_sent']}")
+        else:
+            lines.append("📊 <b>Last daily report:</b> Not yet received")
+
+        if stats["last_alert_sent"]:
+            lines.append(f"🔔 <b>Last alert:</b> {stats['last_alert_sent']}")
+        else:
+            lines.append("🔔 <b>Last alert:</b> None sent")
+
+        status_emoji = "✅" if stats["active"] else "❌"
+        status_text = "Active" if stats["active"] else "Inactive"
+        lines.append(f"\n{status_emoji} <b>Status:</b> {status_text}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.exception("Failed to get stats for user %s: %s", chat_id, e)
+        await update.message.reply_text("❌ Failed to retrieve stats. Please try again later.")
+
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /debug — show scheduler and system status."""
+    if not update.message:
+        return
+
+    config = context.bot_data.get("config")
+    scheduler = context.bot_data.get("scheduler")
+
+    if not scheduler:
+        await update.message.reply_text("Scheduler not initialized")
+        return
+
+    lines = ["<b>🔧 Debug Info</b>\n"]
+    lines.append("<b>Scheduler Status</b>")
+    lines.append(f"Running: {'✅ Yes' if scheduler.running else '❌ No'}")
+
+    jobs = scheduler.get_jobs()
+    lines.append(f"\n<b>Jobs: {len(jobs)}</b>")
+
+    for job in jobs:
+        lines.append(f"\n{job.id}:")
+        lines.append(f"  Next run: {job.next_run_time}")
+        lines.append(f"  Trigger: {job.trigger}")
+
+    if config:
+        lines.append("\n<b>Configuration</b>")
+        db_stats = database.get_db_stats()
+        active = db_stats["active_subscribers"]
+        total = db_stats["total_subscribers"]
+        lines.append(f"Subscribers: {active} active / {total} total")
+        lines.append(f".env chat_ids: {len(config.chat_ids)}")
+        lines.append(f"Indices: {len(config.index_symbols)}")
+        lines.append(f"Alert thresholds: {len(config.drawdown_thresholds_pct)}")
+
+    lines.append("\n<b>Alert State</b>")
+    lines.append(f"Active alerts: {len(alert_state.sent)}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 def setup_scheduler(
     app: Application[Any, Any, Any, Any, Any, Any], config: Config
 ) -> AsyncIOScheduler:
     """Add scheduled jobs for daily report and drawdown checks."""
     scheduler = AsyncIOScheduler()
 
+    # Add event listeners for job execution
+    def job_executed(event):
+        logger.info("Job '%s' executed successfully", event.job_id)
+
+    def job_error(event):
+        logger.error("Job '%s' raised exception: %s", event.job_id, event.exception)
+
+    scheduler.add_listener(job_executed, EVENT_JOB_EXECUTED)
+    scheduler.add_listener(job_error, EVENT_JOB_ERROR)
+
     cron_kw = _cron_from_cronstr(config.daily_report_cron) or {"hour": 22, "minute": 0}
     scheduler.add_job(
         send_daily_report,
         "cron",
         args=[app, config],
+        id="daily_report",
         **cron_kw,
     )
+    logger.info("Scheduled daily report: cron=%s", config.daily_report_cron)
 
     scheduler.add_job(
         check_and_send_alerts,
         "interval",
         args=[app, config],
+        id="alert_check",
         minutes=config.alert_check_minutes,
     )
+    logger.info("Scheduled alert checks: every %d minutes", config.alert_check_minutes)
 
     app.bot_data["scheduler"] = scheduler
     return scheduler
@@ -175,7 +464,8 @@ async def _on_application_ready(application: Application[Any, Any, Any, Any, Any
     scheduler = application.bot_data.get("scheduler")
     if scheduler is not None:
         scheduler.start()
-        logger.info("Scheduler started")
+        jobs = scheduler.get_jobs()
+        logger.info("Scheduler started with %d job(s)", len(jobs))
 
 
 def _cron_from_cronstr(cron: str) -> dict[str, Any]:
@@ -208,6 +498,11 @@ def build_application(config: Config) -> Application[Any, Any, Any, Any, Any, An
     )
     app.bot_data["config"] = config
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("mystats", cmd_mystats))
     app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     return app

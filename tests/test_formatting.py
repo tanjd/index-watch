@@ -22,10 +22,11 @@ def test_format_drawdown_block() -> None:
         gain_to_ath_from_lowest_pct=3.28,
     )
     text = format_drawdown_block("S&P 500", m)
-    assert "S&P 500 Drawdown Metrics" in text
+    assert "📊 S&P 500" in text
     assert "-2.37" in text
     assert "6,836.17" in text
     assert "7,002.28" in text
+    assert "🟢" in text  # Green emoji for healthy drawdown
 
 
 def test_format_fear_greed_none() -> None:
@@ -42,9 +43,10 @@ def test_format_fear_greed_value() -> None:
 def test_format_historical_frequency() -> None:
     text = format_historical_frequency("S&P 500", (5, 10), {5: 100, 10: 30}, 1000)
     assert "S&P 500" in text
-    assert "5% drawdown" in text
+    assert "5%" in text
     assert "100 days" in text
     assert "10.0%" in text
+    assert "🟢" in text  # Green emoji for 5% threshold
 
 
 def test_format_drawdown_alert() -> None:

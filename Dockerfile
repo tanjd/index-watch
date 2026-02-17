@@ -28,6 +28,7 @@ COPY --from=builder --link /app/src /app/src
 COPY --from=builder --link /app/.env.example /app/.env.example
 
 RUN adduser --disabled-password --gecos "" appuser \
+    && mkdir -p /app/data \
     && chown -R appuser:appuser /app
 
 USER appuser
@@ -35,5 +36,8 @@ USER appuser
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app"
+
+# Declare data directory as volume for SQLite persistence
+VOLUME ["/app/data"]
 
 CMD ["python", "-m", "index_watch"]

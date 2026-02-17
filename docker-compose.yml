@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  index-watch:
+    build: .
+    container_name: index-watch-bot
+    restart: unless-stopped
+    volumes:
+      # REQUIRED: Mount data directory for SQLite database persistence
+      - ./data:/app/data
+      # Mount .env file for configuration
+      - ./.env:/app/.env:ro
+    environment:
+      - TZ=UTC
+      - PYTHONUNBUFFERED=1
+    # Optional: Add logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
