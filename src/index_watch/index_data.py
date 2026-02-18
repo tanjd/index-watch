@@ -18,13 +18,13 @@ logger = logging.getLogger(__name__)
 CACHE_TTL_SECONDS = 30 * 60
 
 
-def fetch_index_history(symbol: str, years: int = 20) -> tuple[list[float], datetime]:
+def fetch_index_history(symbol: str, years: int = 20) -> tuple[list[float], datetime, bool]:
     """
-    Fetch historical daily close prices (oldest first) with caching.
+    Fetch historical daily close prices (oldest first) with caching and graceful degradation.
 
     Returns:
-        tuple of (closes, fetched_at) - closes is empty list on failure,
-        fetched_at is when data was retrieved (UTC)
+        tuple of (closes, fetched_at, is_stale) - closes is empty list on complete failure,
+        fetched_at is when data was retrieved (UTC), is_stale indicates if serving old cache
     """
     cache = get_cache()
     cache_key = f"index_history:{symbol}:{years}"
@@ -39,7 +39,7 @@ def fetch_index_history(symbol: str, years: int = 20) -> tuple[list[float], date
             len(closes),
             int((datetime.now(timezone.utc) - fetched_at).total_seconds()),
         )
-        return closes, fetched_at
+        return closes, fetched_at, False
 
     # Fetch fresh data
     end = datetime.now(timezone.utc)
@@ -51,12 +51,18 @@ def fetch_index_history(symbol: str, years: int = 20) -> tuple[list[float], date
         hist = ticker.history(start=start, end=end, auto_adjust=True)
         if hist is None or hist.empty:
             logger.warning(
-                "No data returned for %s (start=%s, end=%s)",
+                "No data returned for %s (start=%s, end=%s) - trying stale cache",
                 symbol,
                 start.date(),
                 end.date(),
             )
-            return [], fetched_at
+            # Try stale cache as fallback
+            stale = cache.get_stale(cache_key)
+            if stale:
+                closes, fetched_at = stale
+                logger.info("Using stale cache for %s (%d days)", symbol, len(closes))
+                return closes, fetched_at, True
+            return [], fetched_at, False
 
         closes = hist["Close"].dropna().tolist()
         result = [float(c) for c in closes]
@@ -64,29 +70,36 @@ def fetch_index_history(symbol: str, years: int = 20) -> tuple[list[float], date
 
         # Cache the result
         cache.set(cache_key, result, CACHE_TTL_SECONDS)
-        return result, fetched_at
+        return result, fetched_at, False
 
     except Exception as e:
-        logger.error("Failed to fetch data for %s: %s", symbol, e, exc_info=True)
-        return [], fetched_at
+        logger.error("Failed to fetch data for %s: %s - trying stale cache", symbol, e)
+        # Try stale cache as fallback
+        stale = cache.get_stale(cache_key)
+        if stale:
+            closes, fetched_at = stale
+            logger.info("Using stale cache for %s (%d days) after error", symbol, len(closes))
+            return closes, fetched_at, True
+        return [], fetched_at, False
 
 
 def get_index_metrics(
     symbol: str, display_name: str, years: int = 20
-) -> tuple[DrawdownMetrics, datetime] | None:
+) -> tuple[DrawdownMetrics, datetime, bool] | None:
     """
     Get drawdown metrics for an index with data timestamp.
 
     Returns:
-        tuple of (metrics, fetched_at) or None if data unavailable
+        tuple of (metrics, fetched_at, is_stale) or None if data unavailable
+        is_stale=True means data is from expired cache (API failure fallback)
     """
-    closes, fetched_at = fetch_index_history(symbol, years=years)
+    closes, fetched_at, is_stale = fetch_index_history(symbol, years=years)
     if len(closes) < 2:
         return None
     current_price = closes[-1]
     ath, lowest_since_ath = compute_ath_and_lowest_since_ath(closes)
     metrics = compute_drawdown_metrics(current_price, ath, lowest_since_ath)
-    return metrics, fetched_at
+    return metrics, fetched_at, is_stale
 
 
 def count_trading_days_at_or_below_drawdown(closes: list[float], threshold_pct: float) -> int:
