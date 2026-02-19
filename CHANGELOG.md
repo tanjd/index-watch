@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.2.0 (2026-02-19)
+
+### Features
+
+- Add rate limiting, enhanced caching, and graceful degradation
+  ([`20f2602`](https://github.com/tanjd/index-watch/commit/20f26022baf3d8a90f3f3af51df398968ae67a69))
+
+
 ## v1.1.0 (2026-02-17)
 
 ### Features
