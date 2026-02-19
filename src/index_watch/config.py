@@ -7,8 +7,9 @@ from pathlib import Path
 DEFAULT_INDEX_SYMBOLS = {"^GSPC": "S&P 500", "^NDX": "NASDAQ-100"}
 DEFAULT_DRAWDOWN_THRESHOLDS = (5, 10, 15, 20)
 DEFAULT_DAILY_REPORT_CRON = "0 22 * * 1-5"  # 22:00 UTC Mon–Fri (after US close)
-DEFAULT_ALERT_CHECK_MINUTES = 30
+DEFAULT_ALERT_CHECK_MINUTES = 60  # Increased from 30 to reduce API calls
 DEFAULT_DISPLAY_TIMEZONE = "Asia/Singapore"  # GMT+8
+DEFAULT_CACHE_TTL_SECONDS = 30 * 60  # 30 minutes cache TTL
 
 
 @dataclass
@@ -17,13 +18,15 @@ class Config:
 
     telegram_bot_token: str = ""
     chat_ids: list[str] = field(default_factory=list)
+    admin_chat_ids: list[str] = field(default_factory=list)
     index_symbols: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_INDEX_SYMBOLS))
     drawdown_thresholds_pct: tuple[int, ...] = DEFAULT_DRAWDOWN_THRESHOLDS
     daily_report_cron: str = DEFAULT_DAILY_REPORT_CRON
     alert_check_minutes: int = DEFAULT_ALERT_CHECK_MINUTES
-    history_years: int = 20
+    history_years: int = 30
     display_timezone: str = DEFAULT_DISPLAY_TIMEZONE
     db_path: Path = field(default_factory=lambda: Path("data") / "index_watch.db")
+    cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -35,6 +38,9 @@ class Config:
 
         raw_chat_ids = os.getenv("TELEGRAM_CHAT_IDS", "").strip()
         chat_ids = [c.strip() for c in raw_chat_ids.split(",") if c.strip()]
+
+        raw_admin_ids = os.getenv("ADMIN_CHAT_IDS", "").strip()
+        admin_chat_ids = [c.strip() for c in raw_admin_ids.split(",") if c.strip()]
 
         raw_thresholds = os.getenv("DRAWDOWN_THRESHOLDS_PCT", "").strip()
         if raw_thresholds:
@@ -48,6 +54,7 @@ class Config:
         return cls(
             telegram_bot_token=token,
             chat_ids=chat_ids,
+            admin_chat_ids=admin_chat_ids,
             drawdown_thresholds_pct=thresholds,
             daily_report_cron=os.getenv("DAILY_REPORT_CRON", DEFAULT_DAILY_REPORT_CRON).strip()
             or DEFAULT_DAILY_REPORT_CRON,
@@ -57,6 +64,7 @@ class Config:
             history_years=int(os.getenv("HISTORY_YEARS", "20")),
             display_timezone=display_tz or DEFAULT_DISPLAY_TIMEZONE,
             db_path=Path(db_path_str),
+            cache_ttl_seconds=int(os.getenv("CACHE_TTL_SECONDS", str(DEFAULT_CACHE_TTL_SECONDS))),
         )
 
     def validate(self) -> None:

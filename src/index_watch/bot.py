@@ -12,6 +12,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from index_watch import database
 from index_watch.alerts import AlertState
+from index_watch.cache import get_cache
 from index_watch.config import Config
 from index_watch.fear_greed import fetch_fear_greed
 from index_watch.formatting import (
@@ -26,14 +27,12 @@ from index_watch.index_data import (
     get_index_metrics,
     historical_drawdown_frequency,
 )
+from index_watch.rate_limiter import RATE_LIMITS, RateLimiter
 
 logger = logging.getLogger(__name__)
 
 alert_state = AlertState()
-
-# Rate limiting: per-user cooldown for /daily command (5 minutes)
-_rate_limit_daily: dict[str, datetime] = {}
-RATE_LIMIT_COOLDOWN_SECONDS = 5 * 60  # 5 minutes
+rate_limiter = RateLimiter()
 
 
 def _build_daily_report(config: Config) -> str:
@@ -41,14 +40,17 @@ def _build_daily_report(config: Config) -> str:
     index_blocks: list[tuple[str, str]] = []
     history_blocks: list[str] = []
     data_timestamps: list[datetime] = []
+    has_stale_data = False
 
     for symbol, name in config.index_symbols.items():
         result = get_index_metrics(symbol, name, years=config.history_years)
         if result:
-            metrics, fetched_at = result
+            metrics, fetched_at, is_stale = result
             data_timestamps.append(fetched_at)
+            if is_stale:
+                has_stale_data = True
             index_blocks.append((name, format_drawdown_block(name, metrics)))
-            closes, _ = fetch_index_history(symbol, years=config.history_years)
+            closes, _, _ = fetch_index_history(symbol, years=config.history_years)
             if closes:
                 freq = historical_drawdown_frequency(closes, config.drawdown_thresholds_pct)
                 history_blocks.append(
@@ -63,7 +65,16 @@ def _build_daily_report(config: Config) -> str:
     # Use earliest data timestamp for "Updated:" display
     data_timestamp = min(data_timestamps) if data_timestamps else datetime.now(timezone.utc)
 
-    return format_daily_report(index_blocks, fear_greed_line, history_blocks, data_timestamp)
+    report = format_daily_report(index_blocks, fear_greed_line, history_blocks, data_timestamp)
+
+    # Add warning if serving stale data
+    if has_stale_data:
+        report = (
+            "⚠️ <i>Some data may be outdated due to API issues. "
+            "Showing most recent available data.</i>\n\n" + report
+        )
+
+    return report
 
 
 async def send_daily_report(app: Application[Any, Any, Any, Any, Any, Any], config: Config) -> None:
@@ -102,8 +113,12 @@ def _check_drawdown_alerts(config: Config, subscribers: list[str]) -> list[tuple
         result = get_index_metrics(symbol, name, years=config.history_years)
         if not result:
             continue
-        metrics, _ = result
-        closes, _ = fetch_index_history(symbol, years=config.history_years)
+        metrics, _, is_stale = result
+        # Skip alerts if data is stale to avoid false alarms
+        if is_stale:
+            logger.warning("Skipping alert check for %s - data is stale", symbol)
+            continue
+        closes, _, _ = fetch_index_history(symbol, years=config.history_years)
         total_days = len(closes)
         alert_state.on_drawdown_improved(
             symbol, metrics.current_drawdown_pct, config.drawdown_thresholds_pct
@@ -196,26 +211,23 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⚠️ Bot is starting up, please try again in a moment.")
         return
 
-    # Rate limiting: 1 request per 5 minutes per user
-    now = datetime.now(timezone.utc)
-    if chat_id in _rate_limit_daily:
-        elapsed = (now - _rate_limit_daily[chat_id]).total_seconds()
-        if elapsed < RATE_LIMIT_COOLDOWN_SECONDS:
-            remaining = int(RATE_LIMIT_COOLDOWN_SECONDS - elapsed)
-            minutes = remaining // 60
-            seconds = remaining % 60
-            await update.message.reply_text(
-                f"⏱ Please wait {minutes}m {seconds}s before requesting another report.\n\n"
-                "This helps protect our API quota. Use /status to see scheduled report times.",
-                parse_mode="HTML",
-            )
-            return
-
-    _rate_limit_daily[chat_id] = now
+    # Rate limiting: 5 minutes per user
+    remaining = rate_limiter.check_rate_limit(chat_id, "daily", RATE_LIMITS["daily"])
+    if remaining is not None:
+        minutes = remaining // 60
+        seconds = remaining % 60
+        await update.message.reply_text(
+            f"⏱ Please wait {minutes}m {seconds}s before requesting another report.\n\n"
+            "This helps protect our API quota. Use /status to see scheduled report times.",
+            parse_mode="HTML",
+        )
+        logger.info("Rate limited /daily for user %s (%ds remaining)", chat_id, remaining)
+        return
 
     try:
         report = await asyncio.to_thread(_build_daily_report, config)
         await update.message.reply_text(report, parse_mode="HTML")
+        logger.info("Sent /daily report to user %s", chat_id)
     except Exception:
         logger.exception("Failed to generate daily report for %s", chat_id)
         await update.message.reply_text(
@@ -228,10 +240,20 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Handle /alerts — show configured thresholds."""
     if not update.message:
         return
+
+    chat_id = str(update.message.chat_id)
+
+    # Rate limiting: 10 seconds
+    remaining = rate_limiter.check_rate_limit(chat_id, "alerts", RATE_LIMITS["alerts"])
+    if remaining is not None:
+        await update.message.reply_text(f"⏱ Please wait {remaining}s before using /alerts again.")
+        return
+
     config = context.bot_data.get("config")
     if not config:
         await update.message.reply_text("Config not loaded.")
         return
+
     th = ", ".join(str(t) + "%" for t in config.drawdown_thresholds_pct)
     parts = [f"Drawdown alert thresholds: {th}"]
     parts.append(f"Indices: {', '.join(config.index_symbols.values())}")
@@ -247,6 +269,14 @@ async def cmd_subscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = str(update.message.chat_id)
     username = update.message.from_user.username if update.message.from_user else None
 
+    # Rate limiting: 1 minute
+    remaining = rate_limiter.check_rate_limit(chat_id, "subscribe", RATE_LIMITS["subscribe"])
+    if remaining is not None:
+        await update.message.reply_text(
+            f"⏱ Please wait {remaining}s before using /subscribe again."
+        )
+        return
+
     try:
         is_new = database.add_subscriber(chat_id, username)
         if is_new:
@@ -259,6 +289,7 @@ async def cmd_subscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
                 "Use /status to check your subscription.",
                 parse_mode="HTML",
             )
+            logger.info("User %s subscribed", chat_id)
         else:
             await update.message.reply_text(
                 "ℹ️ You're already subscribed!\n\nUse /status to check your subscription details.",
@@ -278,6 +309,14 @@ async def cmd_unsubscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE) -
 
     chat_id = str(update.message.chat_id)
 
+    # Rate limiting: 1 minute
+    remaining = rate_limiter.check_rate_limit(chat_id, "unsubscribe", RATE_LIMITS["unsubscribe"])
+    if remaining is not None:
+        await update.message.reply_text(
+            f"⏱ Please wait {remaining}s before using /unsubscribe again."
+        )
+        return
+
     try:
         success = database.remove_subscriber(chat_id)
         if success:
@@ -287,6 +326,7 @@ async def cmd_unsubscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE) -
                 "Use /subscribe to re-enable notifications anytime.",
                 parse_mode="HTML",
             )
+            logger.info("User %s unsubscribed", chat_id)
         else:
             await update.message.reply_text(
                 "ℹ️ You're not currently subscribed.\n\n"
@@ -304,6 +344,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     chat_id = str(update.message.chat_id)
+
+    # Rate limiting: 10 seconds
+    remaining = rate_limiter.check_rate_limit(chat_id, "status", RATE_LIMITS["status"])
+    if remaining is not None:
+        await update.message.reply_text(f"⏱ Please wait {remaining}s before using /status again.")
+        return
+
     config = context.bot_data.get("config")
     scheduler = context.bot_data.get("scheduler")
 
@@ -345,6 +392,12 @@ async def cmd_mystats(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
     chat_id = str(update.message.chat_id)
 
+    # Rate limiting: 10 seconds
+    remaining = rate_limiter.check_rate_limit(chat_id, "mystats", RATE_LIMITS["mystats"])
+    if remaining is not None:
+        await update.message.reply_text(f"⏱ Please wait {remaining}s before using /mystats again.")
+        return
+
     try:
         stats = database.get_subscriber_stats(chat_id)
 
@@ -381,11 +434,26 @@ async def cmd_mystats(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /debug — show scheduler and system status."""
+    """Handle /debug — show scheduler and system status (admin only)."""
     if not update.message:
         return
 
+    chat_id = str(update.message.chat_id)
     config = context.bot_data.get("config")
+
+    # Admin check
+    if config and config.admin_chat_ids:
+        if chat_id not in config.admin_chat_ids:
+            logger.warning("Unauthorized /debug attempt from user %s", chat_id)
+            await update.message.reply_text("⛔️ This command is restricted to administrators.")
+            return
+
+    # Rate limiting: 1 minute
+    remaining = rate_limiter.check_rate_limit(chat_id, "debug", RATE_LIMITS["debug"])
+    if remaining is not None:
+        await update.message.reply_text(f"⏱ Please wait {remaining}s before using /debug again.")
+        return
+
     scheduler = context.bot_data.get("scheduler")
 
     if not scheduler:
@@ -416,6 +484,14 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines.append("\n<b>Alert State</b>")
     lines.append(f"Active alerts: {len(alert_state.sent)}")
+
+    # Cache stats
+    cache = get_cache()
+    cache_stats = cache.get_stats()
+    lines.append("\n<b>Cache Stats</b>")
+    lines.append(f"Entries: {cache_stats['entries']}")
+    lines.append(f"Hits: {cache_stats['hits']} | Misses: {cache_stats['misses']}")
+    lines.append(f"Hit rate: {cache_stats['hit_rate_pct']}%")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
