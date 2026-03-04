@@ -192,8 +192,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /unsubscribe — Stop receiving notifications\n"
         "• /status — Check your subscription status\n"
         "• /daily — Get today's drawdown report\n"
-        "• /alerts — Show configured thresholds\n"
-        "• /debug — Show scheduler status\n\n"
+        "• /alerts — Show configured thresholds\n\n"
         "<i>Use /subscribe to start receiving notifications!</i>",
         parse_mode="HTML",
     )
@@ -496,6 +495,43 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def cmd_clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /clearcache — clear the in-memory data cache (admin only)."""
+    if not update.message:
+        return
+
+    chat_id = str(update.message.chat_id)
+    config = context.bot_data.get("config")
+
+    # Admin check
+    if config and config.admin_chat_ids:
+        if chat_id not in config.admin_chat_ids:
+            logger.warning("Unauthorized /clearcache attempt from user %s", chat_id)
+            await update.message.reply_text("⛔️ This command is restricted to administrators.")
+            return
+
+    # Rate limiting: 30 seconds
+    remaining = rate_limiter.check_rate_limit(chat_id, "clearcache", RATE_LIMITS["clearcache"])
+    if remaining is not None:
+        await update.message.reply_text(
+            f"⏱ Please wait {remaining}s before using /clearcache again."
+        )
+        return
+
+    cache = get_cache()
+    stats_before = cache.get_stats()
+    entries_cleared = stats_before["entries"]
+    cache.clear()
+
+    await update.message.reply_text(
+        f"🗑 <b>Cache cleared.</b>\n\n"
+        f"Removed {entries_cleared} cached {'entry' if entries_cleared == 1 else 'entries'}.\n"
+        f"Fresh data will be fetched on the next request.",
+        parse_mode="HTML",
+    )
+    logger.info("Cache cleared by admin %s (%d entries removed)", chat_id, entries_cleared)
+
+
 def setup_scheduler(
     app: Application[Any, Any, Any, Any, Any, Any], config: Config
 ) -> AsyncIOScheduler:
@@ -581,4 +617,5 @@ def build_application(config: Config) -> Application[Any, Any, Any, Any, Any, An
     app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     return app
