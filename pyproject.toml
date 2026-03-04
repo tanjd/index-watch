@@ -50,7 +50,7 @@ pythonpath = ["."]
 
 # Basedpyright config (replaces pyright for better compatibility)
 [tool.basedpyright]
-pythonVersion = "3.10"
+pythonVersion = "3.13"
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
