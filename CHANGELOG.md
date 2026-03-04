@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.3.0 (2026-03-04)
+
+### Features
+
+- **bot**: Add admin-only /clearcache command ([#2](https://github.com/tanjd/index-watch/pull/2),
+  [`4fe3c87`](https://github.com/tanjd/index-watch/commit/4fe3c8702391819850fd5f7e0bee7ecc38daaa34))
+
+
 ## v1.2.0 (2026-02-19)
 
 ### Features
